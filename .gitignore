@@ -1,0 +1,16 @@
+# Archivos de entorno y secretos (NUNCA SUBIR)
+.env
+
+# Entorno virtual de Python
+venv/
+env/
+
+# Archivos compilados y cache
+__pycache__/
+*.pyc
+
+# Archivos de sistema (Mac)
+.DS_Store
+
+# Logs si los tuvieras
+*.log
