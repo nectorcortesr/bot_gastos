@@ -2,8 +2,8 @@ name: Bot Gastos BCI
 
 on:
   schedule:
-    # 09:00 UTC = 06:00 AM Chile (aprox)
-    - cron: '0 9 * * *'
+    # Recuerda: Hora UTC. (Chile Verano es UTC-3)
+    - cron: '0 15,21,2 * * *'
   workflow_dispatch:
 
 jobs:
