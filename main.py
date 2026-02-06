@@ -1,11 +1,11 @@
 import os
 import json
 import asyncio
+import requests # <--- NUEVA LIBRERÍA (ESTÁNDAR)
 from datetime import date, timedelta
 from dotenv import load_dotenv
 from imap_tools import MailBox, A
 from groq import Groq
-from notion_client import Client
 from telegram import Bot
 from bs4 import BeautifulSoup
 
@@ -17,25 +17,47 @@ try:
     if os.getenv("REMITENTES_PERMITIDOS"):
         REMITENTES_BCI = json.loads(os.getenv("REMITENTES_PERMITIDOS"))
     else:
-        # Default por si no está en el .env
         REMITENTES_BCI = ["contacto@bci.cl", "transferencias@bci.cl", "notificaciones@bci.cl"]
 except:
     REMITENTES_BCI = ["contacto@bci.cl", "transferencias@bci.cl", "notificaciones@bci.cl"]
 
 # Inicialización de Clientes
 GROQ_CLIENT = Groq(api_key=os.getenv("GROQ_API_KEY"))
-NOTION = Client(auth=os.getenv("NOTION_TOKEN"))
 TELEGRAM = Bot(token=os.getenv("TELEGRAM_TOKEN"))
 
 # IDs y Variables
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-NOTION_BUDGET_ID = os.getenv("NOTION_BUDGET_DB_ID") # ID Base de Datos Presupuestos
-NOTION_DB_ID = os.getenv("NOTION_DB_ID")             # ID Base de Datos Transacciones
+NOTION_BUDGET_ID = os.getenv("NOTION_BUDGET_DB_ID") 
+NOTION_DB_ID = os.getenv("NOTION_DB_ID") 
+NOTION_TOKEN = os.getenv("NOTION_TOKEN")
+
+# --- FUNCIONES AUXILIARES NOTION (SIN LIBRERÍA ROTA) ---
+
+def notion_api_request(endpoint, method="POST", payload=None):
+    """Función maestra para hablar con Notion sin usar la librería cliente"""
+    url = f"https://api.notion.com/v1/{endpoint}"
+    headers = {
+        "Authorization": f"Bearer {NOTION_TOKEN}",
+        "Content-Type": "application/json",
+        "Notion-Version": "2022-06-28"
+    }
+    try:
+        if method == "POST":
+            response = requests.post(url, headers=headers, json=payload)
+        else:
+            response = requests.get(url, headers=headers)
+            
+        # Si hay error (400, 404, 401), lanzamos excepción para ver el mensaje
+        response.raise_for_status()
+        return response.json()
+    except requests.exceptions.HTTPError as err:
+        print(f"❌ Error HTTP Notion: {err}")
+        print(f"📩 Respuesta Notion: {response.text}") # <--- AQUÍ VEREMOS EL ERROR REAL
+        return None
 
 # --- 2. FUNCIONES DE LIMPIEZA Y ANÁLISIS ---
 
 def limpiar_html(html_content):
-    """Extrae texto limpio de los correos HTML del banco"""
     if not html_content: return ""
     soup = BeautifulSoup(html_content, 'html.parser')
     for script in soup(["script", "style"]):
@@ -47,15 +69,13 @@ def limpiar_html(html_content):
     return text
 
 def analizar_con_ia(texto_limpio, asunto):
-    """Usa Llama 3 para categorizar Gasto vs Ingreso con reglas chilenas"""
     print(f"🧠 IA Analizando ({len(texto_limpio)} caracteres)...")
     
-    # Lista de categorías que debe coincidir con tu Notion
     categorias_validas = [
         "Comida", "Transporte", "Vivienda", "Ocio", 
         "Ropa", "Supermercado", "Salud", 
         "Servicios", "Transferencias", "Hogar", "Otros",
-        "Ingreso" # <--- Categoría clave para el sueldo
+        "Ingreso"
     ]
 
     prompt = f"""
@@ -109,103 +129,105 @@ def analizar_con_ia(texto_limpio, asunto):
         print(f"❌ Error IA: {e}")
         return None
 
-# --- 3. FUNCIONES DE NOTION ---
+# --- 3. FUNCIONES DE NOTION (VERSIÓN REQUESTS) ---
 
 def guardar_en_notion(data):
-    """Guarda tanto Ingresos como Gastos en la tabla Transacciones"""
     if not data or data.get('monto', 0) == 0: return
     print(f"💾 Guardando: {data['comercio']} (${data['monto']})")
-    try:
-        NOTION.pages.create(
-            parent={"database_id": NOTION_DB_ID},
-            properties={
-                "Nombre": {"title": [{"text": {"content": data["comercio"]}}]},
-                "Monto": {"number": data["monto"]},
-                "Categoria": {"select": {"name": data["categoria"]}},
-                "Fecha": {"date": {"start": data["fecha"]}},
-                "Banco": {"select": {"name": "BCI"}}
-            }
-        )
+    
+    payload = {
+        "parent": {"database_id": NOTION_DB_ID},
+        "properties": {
+            "Nombre": {"title": [{"text": {"content": data["comercio"]}}]},
+            "Monto": {"number": data["monto"]},
+            "Categoria": {"select": {"name": data["categoria"]}},
+            "Fecha": {"date": {"start": data["fecha"]}},
+            "Banco": {"select": {"name": "BCI"}}
+        }
+    }
+    
+    res = notion_api_request("pages", "POST", payload)
+    if res:
         print("✅ ¡Éxito en Notion (Transacciones)!")
-    except Exception as e:
-        print(f"❌ Error Notion Guardar: {e}")
 
 def resetear_ciclo_presupuestario():
-    """Se ejecuta al detectar el SUELDO. Pone 'Gastado' en 0 en toda la tabla Presupuestos."""
     print("🔄 DETECTADO SUELDO: Reiniciando contadores de presupuesto...")
+    if not NOTION_BUDGET_ID: return False
+
+    # 1. Buscar todas las páginas
+    res = notion_api_request(f"databases/{NOTION_BUDGET_ID}/query", "POST", {})
+    if not res: return False
     
-    try:
-        if not NOTION_BUDGET_ID:
-            print("⚠️ Faltan configurar NOTION_BUDGET_DB_ID en .env")
-            return False
-
-        # 1. Obtener todas las filas de presupuestos
-        pages = NOTION.databases.query(database_id=NOTION_BUDGET_ID)["results"]
+    pages = res.get("results", [])
+    for page in pages:
+        # 2. Update a 0
+        notion_api_request(f"pages/{page['id']}", "PATCH", {
+            "properties": {"Gastado": {"number": 0}}
+        })
         
-        if not pages:
-            print("⚠️ La tabla de presupuestos está vacía o no se puede leer.")
-            return False
-
-        # 2. Iterar y poner Gastado en 0
-        for page in pages:
-            NOTION.pages.update(
-                page_id=page["id"],
-                properties={
-                    "Gastado": {"number": 0}
-                }
-            )
-        print("✅ Ciclo reiniciado correctamente.")
-        return True
-    except Exception as e:
-        print(f"❌ Error reiniciando ciclo: {e}")
-        return False
+    print("✅ Ciclo reiniciado correctamente.")
+    return True
 
 def actualizar_presupuesto(categoria_gasto, monto_gasto):
-    """Busca la categoría en Presupuestos y suma el gasto."""
     print(f"💰 Calculando presupuesto para: {categoria_gasto}...")
     
+    if not NOTION_BUDGET_ID: 
+        print("⚠️ No hay ID de presupuesto configurado")
+        return None
+
+    # 1. Buscar categoría
+    payload = {
+        "filter": {
+            "property": "Categoría", # <--- CON TILDE, COMO TU FOTO
+            "title": {"equals": categoria_gasto}
+        }
+    }
+    
+    res = notion_api_request(f"databases/{NOTION_BUDGET_ID}/query", "POST", payload)
+    
+    # DEBUG EXTREMO: Si falla, sabremos por qué
+    if not res:
+        print("❌ Error consultando la base de datos de Presupuestos.")
+        return None
+        
+    results = res.get("results", [])
+    
+    if not results:
+        print(f"⚠️ La consulta funcionó (200 OK) pero NO encontró la categoría '{categoria_gasto}'.")
+        print("👉 Posible causa: ¿La categoría en 'Transacciones' está escrita IDÉNTICA en 'Presupuestos'?")
+        print("👉 Revisa tildes, mayúsculas y espacios.")
+        return None
+
+    page = results[0]
+    props = page["properties"]
+    
+    # Leer valores
     try:
-        if not NOTION_BUDGET_ID: return None
-
-        # Buscar la fila del presupuesto
-        response = NOTION.databases.query(
-            database_id=NOTION_BUDGET_ID,
-            filter={
-                "property": "Categoria",
-                "title": {"equals": categoria_gasto}
-            }
-        )
-        
-        if not response["results"]:
-            print(f"ℹ️ Sin presupuesto definido para {categoria_gasto}")
-            return None
-
-        page = response["results"][0]
-        page_id = page["id"]
-        props = page["properties"]
-        
-        # Leer valores (con seguridad por si están vacíos)
         limite = props.get("Monto Limite", {}).get("number") or 0
         gastado_actual = props.get("Gastado", {}).get("number") or 0
-        
-        nuevo_gastado = gastado_actual + monto_gasto
-        restante = limite - nuevo_gastado
-        
-        # Actualizar Notion
-        NOTION.pages.update(
-            page_id=page_id,
-            properties={"Gastado": {"number": nuevo_gastado}}
-        )
-        
-        return {"limite": limite, "restante": restante}
-    except Exception as e:
-        print(f"❌ Error actualizando presupuesto: {e}")
+    except KeyError:
+        print(f"❌ Error leyendo columnas. Tus columnas son: {list(props.keys())}")
+        print("👉 Asegúrate que se llamen 'Monto Limite' y 'Gastado' (tipo Number)")
         return None
+    
+    nuevo_gastado = gastado_actual + monto_gasto
+    restante = limite - nuevo_gastado
+    
+    # 2. Actualizar
+    update_payload = {
+        "properties": {"Gastado": {"number": nuevo_gastado}}
+    }
+    update_res = notion_api_request(f"pages/{page['id']}", "PATCH", update_payload)
+    
+    if update_res:
+        print(f"✅ Presupuesto actualizado. Restante: ${restante}")
+        return {"limite": limite, "restante": restante}
+    
+    return None
 
 # --- 4. NOTIFICACIONES ---
 
 async def notificar_telegram(data, info_presupuesto=None, es_sueldo=False):
-    # CASO 1: LLEGÓ EL SUELDO
     if es_sueldo:
         mensaje = (
             f"💰 **¡LLEGÓ EL SUELDO!** 💰\n"
@@ -217,7 +239,6 @@ async def notificar_telegram(data, info_presupuesto=None, es_sueldo=False):
         await TELEGRAM.send_message(chat_id=CHAT_ID, text=mensaje, parse_mode="Markdown")
         return
 
-    # CASO 2: GASTO NORMAL
     if not data: return
     
     mensaje = (
@@ -257,7 +278,6 @@ async def main():
     fecha_ayer = date.today() - timedelta(days=1)
 
     with MailBox('imap.gmail.com').login(os.getenv("EMAIL_USER"), os.getenv("EMAIL_PASS")) as mailbox:
-        # Buscamos correos desde ayer
         for msg in mailbox.fetch(A(date_gte=fecha_ayer)):
             
             if msg.from_ in REMITENTES_BCI:
@@ -266,32 +286,23 @@ async def main():
                 html_raw = msg.html or msg.text
                 texto_limpio = limpiar_html(html_raw)
                 
-                # 1. La IA decide qué es (Gasto o Ingreso)
                 data = analizar_con_ia(texto_limpio, msg.subject)
                 
                 if data:
-                    # --- LÓGICA DE SUELDO ---
                     if data['categoria'] == "Ingreso":
                         print(f"🤑 DETECTADO INGRESO: {data['monto']}")
-                        
-                        # Guardamos el ingreso en Notion (Historial)
                         guardar_en_notion(data)
                         
-                        # Si es un monto grande (> 500k) O viene de Assetplan -> RESET
                         if data['monto'] > 500000 or "ASSETPLAN" in data['comercio'].upper():
                             exito = resetear_ciclo_presupuestario()
                             if exito:
                                 await notificar_telegram(data, es_sueldo=True)
                         else:
-                            # Ingreso menor, solo avisar
                             await TELEGRAM.send_message(chat_id=CHAT_ID, text=f"💰 Ingreso extra: ${data['monto']:,} de {data['comercio']}")
                             
-                    # --- LÓGICA DE GASTO ---
                     else:
                         guardar_en_notion(data)
-                        # Calcular Saldo Restante
                         info_presu = actualizar_presupuesto(data['categoria'], data['monto'])
-                        # Avisar con semáforo
                         await notificar_telegram(data, info_presupuesto=info_presu)
 
     print("✅ Fin del proceso.")
