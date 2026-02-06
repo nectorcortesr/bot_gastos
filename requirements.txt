@@ -1,6 +1,6 @@
-imap-tools
-notion-client
-python-telegram-bot
 groq
 python-dotenv
-beautifulsoup4
+imap-tools
+bs4
+python-telegram-bot
+requests
