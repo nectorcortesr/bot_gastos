@@ -274,14 +274,14 @@ async def notificar_telegram(data, info_presupuesto=None, es_sueldo=False):
 # --- 5. BUCLE PRINCIPAL ---
 
 async def main():
-    print("🗓️ Iniciando ejecución diaria...")
-    fecha_ayer = date.today() - timedelta(days=1)
+    print("🗓️ Iniciando ejecución por estado (Solo No Leídos)...")
 
     with MailBox('imap.gmail.com').login(os.getenv("EMAIL_USER"), os.getenv("EMAIL_PASS")) as mailbox:
-        for msg in mailbox.fetch(A(date_gte=fecha_ayer)):
+        
+        for msg in mailbox.fetch(A(seen=False)): 
             
             if msg.from_ in REMITENTES_BCI:
-                print(f"📩 Procesando: {msg.subject}")
+                print(f"📩 Nuevo correo detectado: {msg.subject}")
 
                 html_raw = msg.html or msg.text
                 texto_limpio = limpiar_html(html_raw)
@@ -290,22 +290,17 @@ async def main():
                 
                 if data:
                     if data['categoria'] == "Ingreso":
-                        print(f"🤑 DETECTADO INGRESO: {data['monto']}")
                         guardar_en_notion(data)
-                        
                         if data['monto'] > 500000 or "ASSETPLAN" in data['comercio'].upper():
                             exito = resetear_ciclo_presupuestario()
                             if exito:
                                 await notificar_telegram(data, es_sueldo=True)
-                        else:
-                            await TELEGRAM.send_message(chat_id=CHAT_ID, text=f"💰 Ingreso extra: ${data['monto']:,} de {data['comercio']}")
-                            
                     else:
                         guardar_en_notion(data)
                         info_presu = actualizar_presupuesto(data['categoria'], data['monto'])
                         await notificar_telegram(data, info_presupuesto=info_presu)
 
-    print("✅ Fin del proceso.")
+    print("✅ Fin del proceso. Los correos procesados ahora están marcados como leídos.")
 
 if __name__ == "__main__":
     asyncio.run(main())
